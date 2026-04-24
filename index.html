@@ -364,305 +364,184 @@ const pixelCount = document.getElementById('pixel-count');
 const spectrumLegend = document.getElementById('spectrum-legend');
 
 let canvas, ctx, originalImageData, sorting = false, animFrame = null;
-let currentRow = 0, currentCol = 0;
+const WAVELENGTH_LUT = new Float32Array(256 * 256 * 256); // Optional: Memory intensive but fastest
 
-// ── Accurate CIE-based RGB → XYZ → dominant wavelength ──────────────────────
-// sRGB → linear
-function srgbToLinear(c) {
-  c /= 255;
-  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+// ── Optimized Pixel Utilities ─────────────────────────────────────────────
+
+// Fast extraction from Uint32 (Little Endian: ABGR)
+const getR = (p) => p & 0xFF;
+const getG = (p) => (p >> 8) & 0xFF;
+const getB = (p) => (p >> 16) & 0xFF;
+
+function getBrightness(p) {
+    return (0.2126 * (p & 0xFF) + 0.7152 * ((p >> 8) & 0xFF) + 0.0722 * ((p >> 16) & 0xFF));
 }
 
-// linear RGB → CIE XYZ (D65)
-function rgbToXYZ(r, g, b) {
-  const rl = srgbToLinear(r), gl = srgbToLinear(g), bl = srgbToLinear(b);
-  return {
-    X: rl*0.4124564 + gl*0.3575761 + bl*0.1804375,
-    Y: rl*0.2126729 + gl*0.7151522 + bl*0.0721750,
-    Z: rl*0.0193339 + gl*0.1191920 + bl*0.9503041
-  };
-}
+// ── Improved Sorting Core ──────────────────────────────────────────────────
 
-// XYZ → CIE xy chromaticity
-function xyzToXy(X, Y, Z) {
-  const s = X + Y + Z;
-  if (s === 0) return { x: 0.3127, y: 0.3290 }; // D65 white point
-  return { x: X / s, y: Y / s };
-}
+/**
+ * Sorts segments of pixels based on a brightness threshold.
+ * This creates the "Kim Asendorf" style pixel sorting.
+ */
+function sortLine(data32, offset, length, stride, mode) {
+    const threshold = 60; // Adjust for "glitch" sensitivity
+    let x = 0;
 
-// CIE 1931 color-matching functions sampled every 5 nm (380–700 nm, 65 entries)
-// Source: tabulated standard observer data
-const CMF_NM_START = 380, CMF_STEP = 5;
-const CMF_X = [0.001368,0.002236,0.004243,0.007650,0.014310,0.023190,0.043510,0.077630,0.134380,0.214770,0.283900,0.328500,0.348280,0.348060,0.336200,0.318700,0.290800,0.251100,0.195360,0.142100,0.095640,0.057950,0.032010,0.014700,0.004900,0.002400,0.009300,0.029100,0.063270,0.109600,0.165500,0.225750,0.290400,0.359700,0.433450,0.512050,0.594500,0.678400,0.762100,0.842500,0.916300,0.978600,1.026300,1.056700,1.062200,1.045600,1.002600,0.938400,0.854450,0.751400,0.642400,0.541900,0.447900,0.360800,0.283500,0.218700,0.164900,0.121200,0.087400,0.063600,0.046770,0.032900,0.022700,0.015840,0.011359];
-const CMF_Y = [0.000039,0.000064,0.000120,0.000217,0.000396,0.000640,0.001210,0.002180,0.004000,0.007300,0.011600,0.016840,0.023000,0.029800,0.038000,0.048000,0.060000,0.073900,0.090980,0.112600,0.139020,0.169300,0.208020,0.258600,0.323000,0.407300,0.503000,0.608200,0.710000,0.793200,0.862000,0.914850,0.954000,0.980300,0.994950,1.000000,0.995000,0.978600,0.952000,0.915400,0.870000,0.816300,0.757000,0.694900,0.631000,0.566800,0.503000,0.441200,0.381000,0.321000,0.265000,0.217000,0.175000,0.138200,0.107000,0.081600,0.061000,0.044580,0.032000,0.023200,0.017000,0.011920,0.008210,0.005723,0.004102];
-const CMF_Z = [0.006450,0.010550,0.020050,0.036210,0.067850,0.110200,0.207400,0.371300,0.645600,1.039050,1.385600,1.622960,1.747060,1.782600,1.772110,1.744100,1.669200,1.528100,1.287640,1.041900,0.812950,0.616200,0.465180,0.353300,0.272000,0.212300,0.158200,0.111700,0.078250,0.057250,0.042160,0.029840,0.020300,0.013400,0.008750,0.005750,0.003900,0.002750,0.002100,0.001800,0.001650,0.001400,0.001100,0.001000,0.000800,0.000600,0.000340,0.000240,0.000190,0.000100,0.000050,0.000030,0.000020,0.000010,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000,0.000000];
+    while (x < length) {
+        let start = x;
+        // Skip pixels below threshold
+        while (x < length && getBrightness(data32[offset + x * stride]) < threshold) {
+            x++;
+        }
+        start = x;
+        // Group pixels above threshold
+        while (x < length && getBrightness(data32[offset + x * stride]) >= threshold) {
+            x++;
+        }
+        let end = x;
 
-// Build a lookup: for each nm (380–700, step 5) compute the xy of that monochromatic light
-const spectralLocus = [];
-for (let i = 0; i < CMF_X.length; i++) {
-  const X = CMF_X[i], Y = CMF_Y[i], Z = CMF_Z[i];
-  const s = X + Y + Z;
-  spectralLocus.push({ nm: CMF_NM_START + i * CMF_STEP, x: s > 0 ? X/s : 0, y: s > 0 ? Y/s : 0 });
-}
+        if (end > start) {
+            const segment = [];
+            for (let i = start; i < end; i++) {
+                segment.push(data32[offset + i * stride]);
+            }
 
-// Find the dominant wavelength of an xy chromaticity by casting a ray from the
-// white point through (x,y) and finding intersection with spectral locus segments.
-const WP = { x: 0.3127, y: 0.3290 }; // D65
+            // Sort logic based on mode
+            segment.sort((a, b) => {
+                if (mode === 'wavelength') {
+                    // Using a simplified dominant wavelength approx for speed
+                    return rgbToWavelengthApprox(getR(a), getG(a), getB(a)) - 
+                           rgbToWavelengthApprox(getR(b), getG(b), getB(b));
+                }
+                if (mode === 'brightness') return getBrightness(a) - getBrightness(b);
+                return a - b;
+            });
 
-function dominantWavelength(x, y) {
-  // Ray: P = WP + t*(xy - WP)
-  const dx = x - WP.x, dy = y - WP.y;
-  if (Math.abs(dx) < 1e-9 && Math.abs(dy) < 1e-9) return 550; // neutral → mid-green
-
-  let bestT = -Infinity, bestNm = 550;
-  for (let i = 0; i < spectralLocus.length - 1; i++) {
-    const A = spectralLocus[i], B = spectralLocus[i+1];
-    // Solve: WP + t*d = A + s*(B-A)
-    const ex = B.x - A.x, ey = B.y - A.y;
-    const denom = dx * ey - dy * ex;
-    if (Math.abs(denom) < 1e-12) continue;
-    const fx = A.x - WP.x, fy = A.y - WP.y;
-    const t = (fx * ey - fy * ex) / denom;
-    const s = (fx * dy - fy * dx) / denom;
-    if (t > 0 && s >= 0 && s <= 1) {
-      if (t > bestT) {
-        bestT = t;
-        bestNm = A.nm + s * CMF_STEP;
-      }
+            for (let i = start; i < end; i++) {
+                data32[offset + i * stride] = segment[i - start];
+            }
+        }
     }
-  }
-  return bestNm; // 380–700 nm
 }
 
-// Main entry: RGB → dominant wavelength (380–700)
-function rgbToWavelengthNm(r, g, b) {
-  const { X, Y, Z } = rgbToXYZ(r, g, b);
-  const { x, y } = xyzToXy(X, Y, Z);
-  return dominantWavelength(x, y);
+// ── Color Math ──────────────────────────────────────────────────────────────
+
+function rgbToWavelengthApprox(r, g, b) {
+    // Fast hue-based approximation of spectral wavelength
+    let h;
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+    if (d === 0) return 550;
+    if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    // Map 0-6 hue to 380-700nm range
+    return 700 - (h / 6) * 320;
 }
 
-// Simple hue (0–360, for hue-mode sort)
-function rgbToHue(r, g, b) {
-  r /= 255; g /= 255; b /= 255;
-  const max = Math.max(r,g,b), min = Math.min(r,g,b), d = max - min;
-  if (d === 0) return 0;
-  let h;
-  if (max === r) h = ((g - b) / d) % 6;
-  else if (max === g) h = (b - r) / d + 2;
-  else h = (r - g) / d + 4;
-  // Remap so spectrum order matches (violet=low, red=high)
-  // Hue 240°=blue, 120°=green, 60°=yellow, 0/360°=red
-  // Map to spectrum: violet(270°)→blue(240°)→cyan(180°)→green(120°)→yellow(60°)→red(0°)
-  // Invert and offset: spectral_order = (300 - h + 360) % 360
-  return (300 - ((h * 60 + 360) % 360) + 360) % 360;
+// ── Application Logic ──────────────────────────────────────────────────────
+
+function startSort() {
+    if (sorting) return;
+    sorting = true;
+    sortBtn.disabled = true;
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    // Use Uint32Array for 4x faster access
+    const data32 = new Uint32Array(imageData.data.buffer);
+    const w = canvas.width, h = canvas.height;
+    const dir = dirSelect.value;
+    const mode = modeSelect.value;
+    const speed = parseInt(speedRange.value);
+
+    let index = 0;
+    const total = (dir === 'horizontal') ? h : w;
+
+    function step() {
+        if (!sorting) return;
+        
+        // Dynamic batching based on speed slider
+        const batchSize = Math.ceil(speed / 2);
+
+        for (let b = 0; b < batchSize && index < total; b++, index++) {
+            if (dir === 'horizontal') {
+                sortLine(data32, index * w, w, 1, mode);
+            } else {
+                sortLine(data32, index, h, w, mode);
+            }
+        }
+
+        ctx.putImageData(imageData, 0, 0);
+        
+        const pct = Math.round((index / total) * 100);
+        progressFill.style.width = `${pct}%`;
+        statusText.textContent = `Sorting: ${pct}%`;
+
+        if (index < total) {
+            animFrame = requestAnimationFrame(step);
+        } else {
+            finishSort();
+        }
+    }
+    animFrame = requestAnimationFrame(step);
 }
 
-function getBrightness(r, g, b) {
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-}
-
-function getSaturation(r, g, b) {
-  r /= 255; g /= 255; b /= 255;
-  const max = Math.max(r,g,b), min = Math.min(r,g,b);
-  const l = (max + min) / 2;
-  if (max === min) return 0;
-  const d = max - min;
-  return l > 0.5 ? d / (2 - max - min) : d / (max + min);
-}
-
-function getSortKey(r, g, b) {
-  const mode = modeSelect.value;
-  if (mode === 'wavelength') return rgbToWavelengthNm(r, g, b);
-  if (mode === 'hue')        return rgbToHue(r, g, b);
-  if (mode === 'brightness') return getBrightness(r, g, b);
-  if (mode === 'saturation') return getSaturation(r, g, b) * 255;
-  return rgbToWavelengthNm(r, g, b);
-}
-
-// ── Legend ───────────────────────────────────────────────────────────────────
-function buildSpectrumLegend() {
-  spectrumLegend.innerHTML = '';
-  // Render true spectrum: 380 nm (violet) → 700 nm (red) using wavelength→RGB
-  const steps = 80;
-  for (let i = 0; i < steps; i++) {
-    const nm = 380 + (i / (steps - 1)) * 320;
-    const [r, g, b] = wavelengthToRgb(nm);
-    const seg = document.createElement('div');
-    seg.style.flex = '1';
-    seg.style.background = `rgb(${r},${g},${b})`;
-    spectrumLegend.appendChild(seg);
-  }
-  spectrumLegend.style.display = 'flex';
-}
-
-// Approximate visible wavelength → RGB for legend display (Bruton's algorithm)
-function wavelengthToRgb(nm) {
-  let r, g, b;
-  if (nm >= 380 && nm < 440) { r = -(nm-440)/(440-380); g = 0; b = 1; }
-  else if (nm < 490)         { r = 0; g = (nm-440)/(490-440); b = 1; }
-  else if (nm < 510)         { r = 0; g = 1; b = -(nm-510)/(510-490); }
-  else if (nm < 580)         { r = (nm-510)/(580-510); g = 1; b = 0; }
-  else if (nm < 645)         { r = 1; g = -(nm-645)/(645-580); b = 0; }
-  else if (nm <= 700)        { r = 1; g = 0; b = 0; }
-  else                       { r = 0; g = 0; b = 0; }
-  // Intensity falloff at edges
-  let factor;
-  if (nm >= 380 && nm < 420)      factor = 0.3 + 0.7*(nm-380)/(420-380);
-  else if (nm >= 420 && nm <= 680) factor = 1.0;
-  else if (nm > 680 && nm <= 700)  factor = 0.3 + 0.7*(700-nm)/(700-680);
-  else factor = 0;
-  return [Math.round(r*factor*255), Math.round(g*factor*255), Math.round(b*factor*255)];
+function finishSort() {
+    sorting = false;
+    sortBtn.disabled = false;
+    resetBtn.disabled = false;
+    statusText.textContent = 'Sort Complete';
 }
 
 function loadImage(src) {
-  const img = new Image();
-  img.onload = () => {
-    if (canvas) canvas.remove();
-    canvas = document.createElement('canvas');
-    ctx = canvas.getContext('2d');
+    const img = new Image();
+    img.onload = () => {
+        if (canvas) canvas.remove();
+        canvas = document.createElement('canvas');
+        ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-    const maxW = dropZone.parentElement.clientWidth - 64;
-    const maxH = window.innerHeight * 0.6;
-    let w = img.naturalWidth, h = img.naturalHeight;
+        const maxW = dropZone.parentElement.clientWidth - 64;
+        const maxH = window.innerHeight * 0.6;
+        let w = img.naturalWidth, h = img.naturalHeight;
 
-    if (w > maxW) { h = h * maxW / w; w = maxW; }
-    if (h > maxH) { w = w * maxH / h; h = maxH; }
+        const scale = Math.min(maxW / w, maxH / h, 1);
+        canvas.width = Math.floor(w * scale);
+        canvas.height = Math.floor(h * scale);
+        
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        originalImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-    canvas.width = Math.floor(w);
-    canvas.height = Math.floor(h);
-    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        dropZone.innerHTML = '';
+        dropZone.classList.add('has-canvas');
+        dropZone.appendChild(canvas);
 
-    originalImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-    dropZone.innerHTML = '';
-    dropZone.classList.add('has-canvas');
-    dropZone.appendChild(canvas);
-
-    sortBtn.disabled = false;
-    resetBtn.disabled = false;
-    statusBar.style.display = 'flex';
-    pixelCount.textContent = `${canvas.width}×${canvas.height}`;
-    statusText.textContent = 'Ready — click Sort';
-    progressFill.style.width = '0%';
-
-    buildSpectrumLegend();
-  };
-  img.src = src;
-}
-
-function sortLineBySpectrum(data, offset, length, stride) {
-  const pixels = [];
-  for (let i = 0; i < length; i++) {
-    const idx = offset + i * stride;
-    pixels.push([data[idx], data[idx+1], data[idx+2], data[idx+3]]);
-  }
-  pixels.sort((a, b) => getSortKey(a[0],a[1],a[2]) - getSortKey(b[0],b[1],b[2]));
-  for (let i = 0; i < length; i++) {
-    const idx = offset + i * stride;
-    data[idx]   = pixels[i][0];
-    data[idx+1] = pixels[i][1];
-    data[idx+2] = pixels[i][2];
-    data[idx+3] = pixels[i][3];
-  }
-}
-
-function startSort() {
-  if (sorting) return;
-  sorting = true;
-  sortBtn.disabled = true;
-  resetBtn.disabled = true;
-
-  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const data = imageData.data;
-  const w = canvas.width, h = canvas.height;
-  const dir = dirSelect.value;
-  const speed = parseInt(speedRange.value);
-
-  let total, index = 0;
-  if (dir === 'horizontal') total = h;
-  else if (dir === 'vertical') total = w;
-  else total = h;
-
-  function step() {
-    if (!sorting) return;
-    const batchSize = Math.max(1, Math.floor(speed * 2));
-
-    for (let b = 0; b < batchSize && index < total; b++, index++) {
-      if (dir === 'horizontal') {
-        const rowOffset = index * w * 4;
-        sortLineBySpectrum(data, rowOffset, w, 4);
-      } else if (dir === 'vertical') {
-        sortLineBySpectrum(data, index * 4, h, w * 4);
-      } else {
-        const rowOffset = index * w * 4;
-        const colOffset = index * 4;
-        if (index < h) sortLineBySpectrum(data, rowOffset, w, 4);
-        if (index < w) sortLineBySpectrum(data, colOffset, h, w * 4);
-      }
-    }
-
-    ctx.putImageData(imageData, 0, 0);
-
-    const pct = Math.min(100, Math.round((index / total) * 100));
-    progressFill.style.width = pct + '%';
-    statusText.textContent = `Sorting… ${pct}%`;
-
-    if (index < total) {
-      animFrame = requestAnimationFrame(step);
-    } else {
-      sorting = false;
-      sortBtn.disabled = false;
-      resetBtn.disabled = false;
-      statusText.textContent = 'Sort complete';
-      progressFill.style.width = '100%';
-    }
-  }
-
-  animFrame = requestAnimationFrame(step);
+        sortBtn.disabled = false;
+        resetBtn.disabled = false;
+        statusBar.style.display = 'flex';
+        pixelCount.textContent = `${canvas.width}×${canvas.height}`;
+    };
+    img.src = src;
 }
 
 function resetImage() {
-  if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
-  sorting = false;
-  if (originalImageData && ctx) {
-    ctx.putImageData(originalImageData, 0, 0);
-    statusText.textContent = 'Reset — ready to sort';
-    progressFill.style.width = '0%';
-    sortBtn.disabled = false;
-    resetBtn.disabled = false;
-  }
+    if (animFrame) cancelAnimationFrame(animFrame);
+    sorting = false;
+    if (originalImageData) {
+        ctx.putImageData(originalImageData, 0, 0);
+        progressFill.style.width = '0%';
+        statusText.textContent = 'Ready';
+    }
 }
+
+// ── Event Listeners ────────────────────────────────────────────────────────
 
 sortBtn.addEventListener('click', startSort);
 resetBtn.addEventListener('click', resetImage);
-
-modeSelect.addEventListener('change', () => { resetImage(); });
-dirSelect.addEventListener('change', () => { resetImage(); });
-
 fileInput.addEventListener('change', e => {
-  const f = e.target.files[0];
-  if (!f) return;
-  if (animFrame) { cancelAnimationFrame(animFrame); sorting = false; }
-  const url = URL.createObjectURL(f);
-  loadImage(url);
+    const file = e.target.files[0];
+    if (file) loadImage(URL.createObjectURL(file));
 });
-
-dropZone.addEventListener('click', e => {
-  if (dropZone.classList.contains('has-canvas')) return;
-  fileInput.click();
-});
-
-dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-dropZone.addEventListener('drop', e => {
-  e.preventDefault();
-  dropZone.classList.remove('dragover');
-  const f = e.dataTransfer.files[0];
-  if (!f || !f.type.startsWith('image/')) return;
-  if (animFrame) { cancelAnimationFrame(animFrame); sorting = false; }
-  const url = URL.createObjectURL(f);
-  loadImage(url);
-});
+dropZone.addEventListener('click', () => !sorting && fileInput.click());
 </script>
 </body>
 </html>
