@@ -290,7 +290,7 @@
 <header>
   <div class="title-block">
     <h1>Spectrum Pixel Sorter</h1>
-    <p>CIE XYZ dominant wavelength · physics-accurate spectrum sort</p>
+    <p>Rearranges pixels by light wavelength in real time</p>
   </div>
   <div class="controls">
     <label id="upload-label" for="file-input">Upload Image</label>
@@ -299,8 +299,8 @@
     <div class="option-row">
       <label for="mode-select">Mode</label>
       <select id="mode-select">
-        <option value="wavelength">Wavelength (nm)</option>
-        <option value="hue">Hue (HSL)</option>
+        <option value="hue">Hue (spectrum)</option>
+        <option value="wavelength">Wavelength</option>
         <option value="brightness">Brightness</option>
         <option value="saturation">Saturation</option>
       </select>
@@ -364,184 +364,210 @@ const pixelCount = document.getElementById('pixel-count');
 const spectrumLegend = document.getElementById('spectrum-legend');
 
 let canvas, ctx, originalImageData, sorting = false, animFrame = null;
-const WAVELENGTH_LUT = new Float32Array(256 * 256 * 256); // Optional: Memory intensive but fastest
+let currentRow = 0, currentCol = 0;
 
-// ── Optimized Pixel Utilities ─────────────────────────────────────────────
-
-// Fast extraction from Uint32 (Little Endian: ABGR)
-const getR = (p) => p & 0xFF;
-const getG = (p) => (p >> 8) & 0xFF;
-const getB = (p) => (p >> 16) & 0xFF;
-
-function getBrightness(p) {
-    return (0.2126 * (p & 0xFF) + 0.7152 * ((p >> 8) & 0xFF) + 0.0722 * ((p >> 16) & 0xFF));
+function buildSpectrumLegend() {
+  spectrumLegend.innerHTML = '';
+  const colors = [
+    [148,0,211],[75,0,130],[0,0,255],[0,127,255],
+    [0,255,0],[255,255,0],[255,165,0],[255,0,0]
+  ];
+  colors.forEach(([r,g,b]) => {
+    const seg = document.createElement('div');
+    seg.style.flex = '1';
+    seg.style.background = `rgb(${r},${g},${b})`;
+    spectrumLegend.appendChild(seg);
+  });
+  spectrumLegend.style.display = 'flex';
 }
 
-// ── Improved Sorting Core ──────────────────────────────────────────────────
-
-/**
- * Sorts segments of pixels based on a brightness threshold.
- * This creates the "Kim Asendorf" style pixel sorting.
- */
-function sortLine(data32, offset, length, stride, mode) {
-    const threshold = 60; // Adjust for "glitch" sensitivity
-    let x = 0;
-
-    while (x < length) {
-        let start = x;
-        // Skip pixels below threshold
-        while (x < length && getBrightness(data32[offset + x * stride]) < threshold) {
-            x++;
-        }
-        start = x;
-        // Group pixels above threshold
-        while (x < length && getBrightness(data32[offset + x * stride]) >= threshold) {
-            x++;
-        }
-        let end = x;
-
-        if (end > start) {
-            const segment = [];
-            for (let i = start; i < end; i++) {
-                segment.push(data32[offset + i * stride]);
-            }
-
-            // Sort logic based on mode
-            segment.sort((a, b) => {
-                if (mode === 'wavelength') {
-                    // Using a simplified dominant wavelength approx for speed
-                    return rgbToWavelengthApprox(getR(a), getG(a), getB(a)) - 
-                           rgbToWavelengthApprox(getR(b), getG(b), getB(b));
-                }
-                if (mode === 'brightness') return getBrightness(a) - getBrightness(b);
-                return a - b;
-            });
-
-            for (let i = start; i < end; i++) {
-                data32[offset + i * stride] = segment[i - start];
-            }
-        }
-    }
+function rgbToHue(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r,g,b), min = Math.min(r,g,b);
+  const d = max - min;
+  if (d === 0) return 0;
+  let h;
+  if (max === r) h = ((g - b) / d) % 6;
+  else if (max === g) h = (b - r) / d + 2;
+  else h = (r - g) / d + 4;
+  return ((h * 60) + 360) % 360;
 }
 
-// ── Color Math ──────────────────────────────────────────────────────────────
-
-function rgbToWavelengthApprox(r, g, b) {
-    // Fast hue-based approximation of spectral wavelength
-    let h;
-    r /= 255; g /= 255; b /= 255;
-    const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
-    if (d === 0) return 550;
-    if (max === r) h = (g - b) / d + (g < b ? 6 : 0);
-    else if (max === g) h = (b - r) / d + 2;
-    else h = (r - g) / d + 4;
-    // Map 0-6 hue to 380-700nm range
-    return 700 - (h / 6) * 320;
+function rgbToWavelength(r, g, b) {
+  const hue = rgbToHue(r, g, b);
+  return hue;
 }
 
-// ── Application Logic ──────────────────────────────────────────────────────
-
-function startSort() {
-    if (sorting) return;
-    sorting = true;
-    sortBtn.disabled = true;
-
-    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    // Use Uint32Array for 4x faster access
-    const data32 = new Uint32Array(imageData.data.buffer);
-    const w = canvas.width, h = canvas.height;
-    const dir = dirSelect.value;
-    const mode = modeSelect.value;
-    const speed = parseInt(speedRange.value);
-
-    let index = 0;
-    const total = (dir === 'horizontal') ? h : w;
-
-    function step() {
-        if (!sorting) return;
-        
-        // Dynamic batching based on speed slider
-        const batchSize = Math.ceil(speed / 2);
-
-        for (let b = 0; b < batchSize && index < total; b++, index++) {
-            if (dir === 'horizontal') {
-                sortLine(data32, index * w, w, 1, mode);
-            } else {
-                sortLine(data32, index, h, w, mode);
-            }
-        }
-
-        ctx.putImageData(imageData, 0, 0);
-        
-        const pct = Math.round((index / total) * 100);
-        progressFill.style.width = `${pct}%`;
-        statusText.textContent = `Sorting: ${pct}%`;
-
-        if (index < total) {
-            animFrame = requestAnimationFrame(step);
-        } else {
-            finishSort();
-        }
-    }
-    animFrame = requestAnimationFrame(step);
+function getBrightness(r, g, b) {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
-function finishSort() {
-    sorting = false;
-    sortBtn.disabled = false;
-    resetBtn.disabled = false;
-    statusText.textContent = 'Sort Complete';
+function getSaturation(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r,g,b), min = Math.min(r,g,b);
+  const l = (max + min) / 2;
+  if (max === min) return 0;
+  const d = max - min;
+  return l > 0.5 ? d / (2 - max - min) : d / (max + min);
+}
+
+function getSortKey(r, g, b) {
+  const mode = modeSelect.value;
+  if (mode === 'hue' || mode === 'wavelength') return rgbToHue(r, g, b);
+  if (mode === 'brightness') return getBrightness(r, g, b);
+  if (mode === 'saturation') return getSaturation(r, g, b) * 255;
+  return rgbToHue(r, g, b);
 }
 
 function loadImage(src) {
-    const img = new Image();
-    img.onload = () => {
-        if (canvas) canvas.remove();
-        canvas = document.createElement('canvas');
-        ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const img = new Image();
+  img.onload = () => {
+    if (canvas) canvas.remove();
+    canvas = document.createElement('canvas');
+    ctx = canvas.getContext('2d');
 
-        const maxW = dropZone.parentElement.clientWidth - 64;
-        const maxH = window.innerHeight * 0.6;
-        let w = img.naturalWidth, h = img.naturalHeight;
+    const maxW = dropZone.parentElement.clientWidth - 64;
+    const maxH = window.innerHeight * 0.6;
+    let w = img.naturalWidth, h = img.naturalHeight;
 
-        const scale = Math.min(maxW / w, maxH / h, 1);
-        canvas.width = Math.floor(w * scale);
-        canvas.height = Math.floor(h * scale);
-        
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        originalImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    if (w > maxW) { h = h * maxW / w; w = maxW; }
+    if (h > maxH) { w = w * maxH / h; h = maxH; }
 
-        dropZone.innerHTML = '';
-        dropZone.classList.add('has-canvas');
-        dropZone.appendChild(canvas);
+    canvas.width = Math.floor(w);
+    canvas.height = Math.floor(h);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
-        sortBtn.disabled = false;
-        resetBtn.disabled = false;
-        statusBar.style.display = 'flex';
-        pixelCount.textContent = `${canvas.width}×${canvas.height}`;
-    };
-    img.src = src;
+    originalImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    dropZone.innerHTML = '';
+    dropZone.classList.add('has-canvas');
+    dropZone.appendChild(canvas);
+
+    sortBtn.disabled = false;
+    resetBtn.disabled = false;
+    statusBar.style.display = 'flex';
+    pixelCount.textContent = `${canvas.width}×${canvas.height}`;
+    statusText.textContent = 'Ready — click Sort';
+    progressFill.style.width = '0%';
+
+    buildSpectrumLegend();
+  };
+  img.src = src;
+}
+
+function sortLineBySpectrum(data, offset, length, stride) {
+  const pixels = [];
+  for (let i = 0; i < length; i++) {
+    const idx = offset + i * stride;
+    pixels.push([data[idx], data[idx+1], data[idx+2], data[idx+3]]);
+  }
+  pixels.sort((a, b) => getSortKey(a[0],a[1],a[2]) - getSortKey(b[0],b[1],b[2]));
+  for (let i = 0; i < length; i++) {
+    const idx = offset + i * stride;
+    data[idx]   = pixels[i][0];
+    data[idx+1] = pixels[i][1];
+    data[idx+2] = pixels[i][2];
+    data[idx+3] = pixels[i][3];
+  }
+}
+
+function startSort() {
+  if (sorting) return;
+  sorting = true;
+  sortBtn.disabled = true;
+  resetBtn.disabled = true;
+
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  const w = canvas.width, h = canvas.height;
+  const dir = dirSelect.value;
+  const speed = parseInt(speedRange.value);
+
+  let total, index = 0;
+  if (dir === 'horizontal') total = h;
+  else if (dir === 'vertical') total = w;
+  else total = h;
+
+  function step() {
+    if (!sorting) return;
+    const batchSize = Math.max(1, Math.floor(speed * 2));
+
+    for (let b = 0; b < batchSize && index < total; b++, index++) {
+      if (dir === 'horizontal') {
+        const rowOffset = index * w * 4;
+        sortLineBySpectrum(data, rowOffset, w, 4);
+      } else if (dir === 'vertical') {
+        sortLineBySpectrum(data, index * 4, h, w * 4);
+      } else {
+        const rowOffset = index * w * 4;
+        const colOffset = index * 4;
+        if (index < h) sortLineBySpectrum(data, rowOffset, w, 4);
+        if (index < w) sortLineBySpectrum(data, colOffset, h, w * 4);
+      }
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+
+    const pct = Math.min(100, Math.round((index / total) * 100));
+    progressFill.style.width = pct + '%';
+    statusText.textContent = `Sorting… ${pct}%`;
+
+    if (index < total) {
+      animFrame = requestAnimationFrame(step);
+    } else {
+      sorting = false;
+      sortBtn.disabled = false;
+      resetBtn.disabled = false;
+      statusText.textContent = 'Sort complete';
+      progressFill.style.width = '100%';
+    }
+  }
+
+  animFrame = requestAnimationFrame(step);
 }
 
 function resetImage() {
-    if (animFrame) cancelAnimationFrame(animFrame);
-    sorting = false;
-    if (originalImageData) {
-        ctx.putImageData(originalImageData, 0, 0);
-        progressFill.style.width = '0%';
-        statusText.textContent = 'Ready';
-    }
+  if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
+  sorting = false;
+  if (originalImageData && ctx) {
+    ctx.putImageData(originalImageData, 0, 0);
+    statusText.textContent = 'Reset — ready to sort';
+    progressFill.style.width = '0%';
+    sortBtn.disabled = false;
+    resetBtn.disabled = false;
+  }
 }
-
-// ── Event Listeners ────────────────────────────────────────────────────────
 
 sortBtn.addEventListener('click', startSort);
 resetBtn.addEventListener('click', resetImage);
+
+modeSelect.addEventListener('change', () => { resetImage(); });
+dirSelect.addEventListener('change', () => { resetImage(); });
+
 fileInput.addEventListener('change', e => {
-    const file = e.target.files[0];
-    if (file) loadImage(URL.createObjectURL(file));
+  const f = e.target.files[0];
+  if (!f) return;
+  if (animFrame) { cancelAnimationFrame(animFrame); sorting = false; }
+  const url = URL.createObjectURL(f);
+  loadImage(url);
 });
-dropZone.addEventListener('click', () => !sorting && fileInput.click());
+
+dropZone.addEventListener('click', e => {
+  if (dropZone.classList.contains('has-canvas')) return;
+  fileInput.click();
+});
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  const f = e.dataTransfer.files[0];
+  if (!f || !f.type.startsWith('image/')) return;
+  if (animFrame) { cancelAnimationFrame(animFrame); sorting = false; }
+  const url = URL.createObjectURL(f);
+  loadImage(url);
+});
 </script>
 </body>
 </html>
